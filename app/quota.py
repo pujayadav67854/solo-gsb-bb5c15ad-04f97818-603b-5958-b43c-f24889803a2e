@@ -607,6 +607,22 @@ def _refill(
     return min(float(capacity), float(balance) + elapsed * float(refill_rate))
 
 
+def _balance_covers(balance: float, cost: float) -> bool:
+    """全服务唯一的「判足」口径：桶的**实际余额**（补充后）足以扣减 cost 才判足。
+
+    严格按浮点数值比较，**不加任何容差**：
+      - 恰好足额（``balance == cost``）仍判足放行（扣减后余额恰为 0）；
+      - 只要 ``balance < cost``，哪怕仅差极小量（如容量 1、补充率 0 时
+        ``cost=1.0000000000005``、balance=1）也判不足。
+
+    单笔/批量裁决、预占创建、结算补扣、路由移拨，以及只读的影响预演、配额
+    规划与拒绝后的可重试时间演算，全部沿用本规则。容差放行曾导致扣后余额为
+    负、撞上 ``buckets.balance`` 的 ``CHECK (balance >= 0)`` 约束，使请求以
+    500 失败且不留下应有的拒绝/批次/预占存档。
+    """
+    return float(balance) >= float(cost)
+
+
 def _bucket_out(
     scope: str,
     tenant: str,
@@ -855,10 +871,15 @@ def _segment_ready_at(
 
     边界点 end 属于下一段（切换在 effective_at 时刻先按比例换算余额），
     故本段的就绪时刻必须严格小于 end。
+
+    判足与裁决同一口径（_balance_covers，无容差）：余额恰为 cost 也算就绪；
+    rate=0 且余额严格小于 cost、或 cost 超过容量（cost > cap，等多久都补不满）
+    时本段不可达。容量始终小于消耗且切换后仍无补足路径时，最终段在此返回
+    None，调用方据此给出 retry_possible=false。
     """
-    if bal + 1e-12 >= cost:
+    if _balance_covers(bal, cost):
         return start
-    if rate <= 0.0 or cost > cap + 1e-12:
+    if rate <= 0.0 or cost > cap:
         return None
     t = start + (cost - bal) / rate
     if end is not None and t >= end:
@@ -1037,7 +1058,10 @@ def decide(
             }
         )
 
-    allowed = all(s["balance"] + 1e-12 >= cost for s in states)
+    # 判足严格按实际余额（_balance_covers，无容差）：恰好足额放行、扣到 0；
+    # 余额即便仅差极小量（如 1 vs 1.0000000000005）也判不足，避免扣出负余额
+    # 触发 CHECK(balance>=0) 而以 500 失败且漏掉拒绝存档。
+    allowed = all(_balance_covers(s["balance"], cost) for s in states)
 
     # 4) 不足：整组一个都不扣（补充本身会落库，这是时间应得的令牌）；
     #    充足：所有命中桶在同一事务中一起扣减
@@ -1309,7 +1333,9 @@ def decide_batch(
                 "request_id_exists"))
         seen_request_ids.add(request_id)
 
-        if not all(s["balance"] + 1e-12 >= cost for s in item_states):
+        # 判足与单笔裁决同一口径（_balance_covers，无容差）：恰好足额放行，
+        # 余额严格小于 cost（即便仅差极小量）即整批失败、一个令牌都不模拟扣
+        if not all(_balance_covers(s["balance"], cost) for s in item_states):
             raise BatchRejected(idx, "insufficient_balance", _batch_failure(
                 idx, request_id, cost, tenant_id, route_id, item_states,
                 "insufficient_balance"))
@@ -1656,7 +1682,9 @@ def impact_preview(
                     st["balance"] + (at - st["t"]) * st["refill_rate"],
                 )
                 st["t"] = at
-            allowed = all(states[k]["balance"] + 1e-12 >= cost for k in hit)
+            # 判足与真实裁决同一口径（_balance_covers，无容差），只读演算
+            # 因此不会让实际会被拒绝（甚至扣成负余额）的请求在预演中放行
+            allowed = all(_balance_covers(states[k]["balance"], cost) for k in hit)
             if allowed:
                 for k in hit:
                     states[k]["balance"] -= cost
@@ -1853,7 +1881,9 @@ def plan_quota(
         i = order[pos]
         cost = float(items[i]["cost"])
         demand = item_buckets[i]
-        if all(caps[b] + 1e-12 >= cost for b in demand):
+        # 规划的占用判足与真实裁决同一口径（_balance_covers，无容差）：
+        # 恰好足额可入选，严格不足则该桶约束下该项不可行
+        if all(_balance_covers(caps[b], cost) for b in demand):
             for b in demand:
                 caps[b] -= cost
             current_ids.append(items[i]["item_id"])
@@ -2268,7 +2298,9 @@ def create_reservation(
             }
         )
 
-    allowed = all(s["balance"] + 1e-12 >= cost for s in states)
+    # 判足与裁决同一口径（_balance_covers，无容差）：恰好足额才统一预扣、
+    # 扣到 0；余额严格小于 cost（即便仅差极小量）即全部不扣、rejected 存档
+    allowed = all(_balance_covers(s["balance"], cost) for s in states)
     now_iso = iso(now)
     expire_at = iso(now + timedelta(seconds=int(ttl_seconds)))
     bucket_keys = [[s["scope"], s["tenant"], s["route"]] for s in states]
@@ -2489,7 +2521,9 @@ def _settle_adjust_buckets(
             continue
         cap, rate = float(pol["capacity"]), float(pol["refill_rate"])
         balance = _refill(b["balance"], b["updated_at"], cap, rate, now)
-        if delta > 0.0 and balance + 1e-12 < delta:
+        # 补扣判足与裁决同一口径（_balance_covers，无容差）：实际余额严格小于
+        # 差额（即便仅差极小量）即判不足，绝不允许补扣出负余额
+        if delta > 0.0 and not _balance_covers(balance, delta):
             raise HTTPException(
                 409,
                 f"结算补扣失败：原命中桶 scope={scope!r} tenant_id={tenant or None!r} "
@@ -2765,15 +2799,17 @@ def route_transfer(
     src_cap = float(src_pol["capacity"])
     dst_cap = float(dst_pol["capacity"])
 
-    # 源不足 / 目标超容量：冲突，一个令牌都不扣增（前序事务的补充与到期
-    # 处理已提交；本事务仅回滚可能的桶行与移拨存档）
-    if src_balance + 1e-12 < amount:
+    # 判足与容量上限均按实际余额/容量严格比较（_balance_covers，无容差）：
+    # 源余额严格小于移拨量（即便仅差极小量）即判不足；目标装入后必须
+    # **不超过**容量（恰好装满允许）。冲突时一个令牌都不扣增（前序事务的
+    # 补充与到期处理已提交；本事务仅回滚可能的桶行与移拨存档）
+    if not _balance_covers(src_balance, amount):
         raise HTTPException(
             409,
             f"源路由桶余额不足：tenant_id={tenant_id!r} route_id={source_route_id!r} "
             f"补充后余额 {src_balance:g}，需要移拨 {amount:g}，不移拨任何令牌",
         )
-    if dst_balance + amount > dst_cap + 1e-12:
+    if dst_balance + amount > dst_cap:
         raise HTTPException(
             409,
             f"目标路由桶容量不足：tenant_id={tenant_id!r} route_id={target_route_id!r} "

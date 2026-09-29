@@ -4299,3 +4299,251 @@ def test_legacy_whole_second_rows_in_db_are_handled(tmp_path, monkeypatch):
         assert r.status_code == 200
         assert r.json()["buckets"][0]["capacity"] == 50.0
         assert client.get("/policy-changes/chg-legacy").json()["status"] == "applied"
+
+
+# ---------------------------------------- 判足边界：实际余额严格比较（无容差）
+#
+# 背景：容量 1、补充率 0 时 cost=1.0000000000005 曾被 1e-12 容差判足放行，
+# 扣后余额 -5e-13 触发 buckets.CHECK(balance>=0)，请求 500 且不留下拒绝记录。
+# 下列测试固定修复后的统一口径：只有实际余额 >= 消耗才扣减；恰好足额放行，
+# 哪怕仅差极小量也按「不足」走原有拒绝/回滚/冲突路径；只读预演/规划与
+# 拒绝后的可重试时间按同一口径演算，容量恒小于消耗且无补足路径则不可重试。
+
+TINY = 1.0000000000005  # 比 1 大 5e-13，仍落在旧判足容差 1e-12 之内（曾被误判足）
+
+
+def test_decide_tiny_over_cost_is_denied_and_recorded_no_negative_balance(client):
+    put_policy(client, "global", 1, 0)
+
+    r = client.post("/decide", json={"request_id": "d-tiny", "cost": TINY})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["allowed"] is False
+    assert body["replayed"] is False
+    # 容量恒低于消耗且补充率为 0、无待生效切换 -> 不可重试
+    assert body["retry_possible"] is False
+    assert body["retry_at"] is None
+    assert body["retry_after_seconds"] is None
+    # 余额维持满额，绝不出现负值
+    assert body["buckets"][0]["balance"] == 1.0
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+
+    # 拒绝结果已存档：同键同载荷重放原拒绝，不再次扣减
+    replay = client.post("/decide", json={"request_id": "d-tiny", "cost": TINY})
+    assert replay.status_code == 200
+    rb = replay.json()
+    assert rb["allowed"] is False
+    assert rb["replayed"] is True
+    assert rb["retry_possible"] is False
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+
+
+def test_decide_exact_full_cost_still_passes_and_leaves_zero(client):
+    put_policy(client, "global", 1, 0)
+    r = client.post("/decide", json={"request_id": "d-exact", "cost": 1})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["allowed"] is True
+    assert body["buckets"][0]["balance"] == 0.0
+    # 桶打空后，再请求同样消耗（无补充）被拒且不可重试
+    again = client.post("/decide", json={"request_id": "d-next", "cost": 1}).json()
+    assert again["allowed"] is False
+    assert again["retry_possible"] is False
+
+
+def test_decide_tiny_over_multilevel_denies_whole_group_without_deducting(client):
+    put_policy(client, "global", 1, 0)
+    put_policy(client, "tenant", 1, 0, tenant="t")
+    # 全局与租户桶都只有 1：任一桶按实际余额判不足，整组一个都不扣
+    r = client.post(
+        "/decide",
+        json={"request_id": "d-ml", "tenant_id": "t", "cost": TINY},
+    ).json()
+    assert r["allowed"] is False
+    assert r["retry_possible"] is False
+    by_scope = {b["scope"]: b["balance"] for b in r["buckets"]}
+    assert by_scope == {"global": 1.0, "tenant": 1.0}
+
+
+def test_decide_tiny_over_with_refill_predicts_retry(client, clock):
+    # 桶已空（0）、补充率 1/s：消耗 1.0000000000005 超过容量 1 -> 永不可重试；
+    # 而容量 >= 消耗、仅差一点时应给出按补充率推算的等待时间。
+    put_policy(client, "global", 2, 1)
+    # 花掉 1：余额 1；再请求比余额多 5e-13 的量
+    assert client.post("/decide", json={"request_id": "seed", "cost": 1}).json()["allowed"]
+    r = client.post("/decide", json={"request_id": "d-wait", "cost": TINY}).json()
+    assert r["allowed"] is False
+    assert r["retry_possible"] is True
+    # 缺 5e-13 令牌 @1/s -> 等待 5e-13 秒（非负、极小）
+    assert r["retry_after_seconds"] == pytest.approx(5e-13, rel=0.5, abs=1e-9)
+
+
+def test_batch_tiny_over_cost_rolls_back_and_persists_failure(client):
+    put_policy(client, "global", 1, 0)
+    # 先落一个余额为 1 的桶行：打空后撤销，桶保留、余额回到 1
+    client.post("/decide", json={"request_id": "seed", "cost": 1})
+    client.post("/decide/seed/revoke")
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+
+    r = post_batch(client, "b-tiny", [
+        {"request_id": "q1", "cost": 1.0},
+        {"request_id": "q2", "cost": TINY},
+    ])
+    assert r.status_code == 200
+    body = r.json()
+    # 首项恰好足额本可通过，但次项（首项模拟扣减后余额为 0）严格不足
+    assert body["committed"] is False
+    assert body["failed_index"] == 1
+    assert body["failure"]["reason"] == "insufficient_balance"
+    # 整组回滚：桶仍是满额 1，批次内任何单笔都未写入 decisions
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+    q1 = client.post("/decide", json={"request_id": "q1", "cost": 1.0}).json()
+    assert q1["replayed"] is False
+    assert q1["allowed"] is True  # 回滚后首项仍可正常裁决并把桶打成 0
+
+    # 桶恢复到 1 后，同 batch_id 同载荷重放原失败存档（replayed=true，不扣减）
+    client.post("/decide/q1/revoke")
+    replay = post_batch(client, "b-tiny", [
+        {"request_id": "q1", "cost": 1.0},
+        {"request_id": "q2", "cost": TINY},
+    ])
+    assert replay.status_code == 200
+    rb = replay.json()
+    assert rb["committed"] is False
+    assert rb["replayed"] is True
+    assert rb["failed_index"] == 1
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+
+
+def test_batch_exact_full_cost_commits(client):
+    put_policy(client, "global", 1, 0)
+    body = post_batch(client, "b-exact", [{"request_id": "q-only", "cost": 1}]).json()
+    assert body["committed"] is True
+    assert body["results"][0]["buckets"][0]["balance"] == 0.0
+
+
+def test_reservation_tiny_over_cost_is_rejected_and_replayable(client, clock):
+    put_policy(client, "global", 1, 0)
+    r = _reserve(client, "rsv-tiny", TINY, ttl=60)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "rejected"
+    assert body["allowed"] is False
+    assert body["buckets"][0]["balance"] == 1.0
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+    # rejected 存档可重放，不扣减
+    replay = _reserve(client, "rsv-tiny", TINY, ttl=60).json()
+    assert replay["status"] == "rejected"
+    assert replay["replayed"] is True
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+
+
+def test_settle_supplement_tiny_short_conflicts_keeps_pending_no_negative(client, clock):
+    # 预占恰好 1：桶 1 -> 0；结算实际用量 1.0000000000005（补扣 5e-13），
+    # 补充率 0 永补不足 -> 409，预占保持 pending，余额不得为负
+    put_policy(client, "global", 1, 0)
+    assert _reserve(client, "rsv-s", 1, ttl=60).json()["status"] == "pending"
+    assert client.get("/buckets").json()[0]["balance"] == 0.0
+
+    r = _settle(client, "rsv-s", TINY)
+    assert r.status_code == 409
+    assert client.get("/reservations/rsv-s").json()["status"] == "pending"
+    assert client.get("/buckets").json()[0]["balance"] == 0.0
+
+    # 时间推进也补不出来（速率 0）：重试仍是 409
+    clock.advance(10)
+    assert _settle(client, "rsv-s", TINY).status_code == 409
+    assert client.get("/buckets").json()[0]["balance"] == 0.0
+
+    # 改按恰好预占量结算 -> 成功（无净扣补），不写负余额
+    ok = _settle(client, "rsv-s", 1)
+    assert ok.status_code == 200
+    assert ok.json()["status"] == "settled"
+
+
+def test_route_transfer_tiny_over_source_conflicts_without_negative(client):
+    _setup_two_routes(client, cap_a=1, cap_b=10, rate=0)
+    # 给目标桶腾出 1 个令牌空间（10 -> 9），源桶仍为未建行的满额 1
+    assert client.post(
+        "/decide",
+        json={"request_id": "d-b", "tenant_id": "t1", "route_id": "rB", "cost": 1},
+    ).json()["allowed"] is True
+    # 源桶满额 1，移拨比余额多 5e-13 -> 409，源不扣、目标不增、不留存档、不建桶
+    r = _transfer(client, "tr-tiny", "t1", "rA", "rB", TINY)
+    assert r.status_code == 409
+    assert _route_balance(client, "t1", "rA") is None
+    assert _route_balance(client, "t1", "rB") == 9.0
+    # 失败不占用 transfer_id：同编号改为恰好 1（源满额恰好足额）移拨成功
+    ok = _transfer(client, "tr-tiny", "t1", "rA", "rB", 1)
+    assert ok.status_code == 200
+    assert ok.json()["source"]["balance"] == 0.0
+    assert ok.json()["target"]["balance"] == 10.0  # 9 + 1 恰好装满
+    # 同键同载荷重放原成功结果，不再次移拨
+    replay = _transfer(client, "tr-tiny", "t1", "rA", "rB", 1)
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert replay.json()["source"]["balance"] == 0.0
+    assert replay.json()["target"]["balance"] == 10.0
+
+
+def test_route_transfer_tiny_over_target_capacity_conflicts(client):
+    # 验证目标容量判定也无容差：目标余额 + amount 必须不超过容量（恰好装满允许）。
+    _setup_two_routes(client, cap_a=10, cap_b=2, rate=0)
+    # 目标 rB 花掉 1 -> 余额 1（容量 2，仅剩 1 空间）；源满额 10（未建行）。
+    assert client.post(
+        "/decide",
+        json={"request_id": "d-b", "tenant_id": "t1", "route_id": "rB", "cost": 1},
+    ).json()["allowed"] is True
+    r = _transfer(client, "tr-over", "t1", "rA", "rB", TINY)
+    assert r.status_code == 409
+    assert _route_balance(client, "t1", "rB") == 1.0
+    assert _route_balance(client, "t1", "rA") is None  # 源未建行，失败不建桶
+    # 恰好装满（移拨 1）允许：成功后源才惰性建桶
+    ok = _transfer(client, "tr-over", "t1", "rA", "rB", 1)
+    assert ok.status_code == 200
+    assert ok.json()["target"]["balance"] == 2.0
+    assert ok.json()["source"]["balance"] == 9.0
+
+
+def test_impact_preview_uses_exact_sufficiency_rule(client):
+    # 现行策略容量 2、速率 0（桶满额 2）；预演候选容量 1、速率 0。
+    # 候选侧起点余额截断到候选容量 1。消耗 1.0000000000005：
+    #   现行侧（余额 2）充足 -> 放行；
+    #   候选侧（余额 1）严格不足 -> 拒绝且不扣。
+    put_policy(client, "global", 2, 0)
+    r = post_preview(client, "global", 1, 0, [
+        {"cost": TINY, "at_seconds": 0},
+    ])
+    assert r.status_code == 200
+    item = r.json()["items"][0]
+    assert item["current"]["allowed"] is True
+    assert item["current"]["buckets"][0]["balance"] == pytest.approx(2 - TINY)
+    assert item["candidate"]["allowed"] is False
+    assert item["candidate"]["buckets"][0]["balance"] == 1.0
+    assert item["allowed_changed"] is True
+
+    # 恰好足额在两侧都放行（候选余额 1、cost 1，扣到 0）
+    r2 = post_preview(client, "global", 1, 0, [{"cost": 1, "at_seconds": 0}])
+    it2 = r2.json()["items"][0]
+    assert it2["current"]["allowed"] is True
+    assert it2["candidate"]["allowed"] is True
+    assert it2["candidate"]["buckets"][0]["balance"] == 0.0
+
+
+def test_quota_plan_uses_exact_sufficiency_rule(client):
+    put_policy(client, "global", 1, 0)
+    # 消耗 1.0000000000005 > 快照余额 1 -> 该项不可行，不入选，剩余额仍是 1
+    r = post_plan(client, [
+        {"item_id": "a", "tenant_id": "t", "cost": TINY, "value": 10},
+    ])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["selected_item_ids"] == []
+    assert body["unselected_item_ids"] == ["a"]
+    assert body["total_value"] == 0
+    assert body["buckets"][0]["balance"] == 1.0
+
+    # 恰好足额可入选，剩余额为 0
+    ok = post_plan(client, [{"item_id": "b", "tenant_id": "t", "cost": 1, "value": 1}])
+    assert ok.json()["selected_item_ids"] == ["b"]
+    assert ok.json()["buckets"][0]["balance"] == 0.0

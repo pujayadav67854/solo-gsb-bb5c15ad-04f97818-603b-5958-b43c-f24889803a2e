@@ -651,6 +651,44 @@ curl -s -X POST http://localhost:8000/decide \
 }
 ```
 
+### 3b. 严格判足边界（容量 1、补充率 0、cost 比余额大一个 ulp）
+
+> 判足只认真实余额、不设浮点容差。下列序列可直接调用（先放一个容量 1、
+> 补充率 0 的全局桶）：
+
+```bash
+# 准备：容量 1、永不补充的全局桶（新桶满额，余额恰为 1）
+admin_curl PUT /policies '{"scope":"global","capacity":1,"refill_rate":0}'
+
+# cost=1.0000000000005 只比余额大一个 ulp：旧实现会误放行并把余额扣成负数、
+# 触发数据库 CHECK 约束返回 500；现在按正常业务拒绝——HTTP 200、allowed=false、
+# 整组不扣（余额仍为 1），且容量恒低于消耗、补充率为 0 -> retry_possible=false
+curl -s -X POST http://localhost:8000/decide \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"edge-1","cost":1.0000000000005}'
+# {"allowed": false, "retry_possible": false, "retry_at": null,
+#  "buckets": [{"scope": "global", "capacity": 1.0, "balance": 1.0}], ...}
+
+# 拒绝记录已存档：同 request_id + 同载荷重放原拒绝（replayed=true），不再次扣减
+curl -s -X POST http://localhost:8000/decide \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"edge-1","cost":1.0000000000005}'
+# {"allowed": false, "replayed": true, "buckets": [{"balance": 1.0}], ...}
+
+# 恰好足额（cost 恰为 1）仍正常通过，扣减后余额恰为 0，不是服务错误
+curl -s -X POST http://localhost:8000/decide \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"edge-2","cost":1}'
+# {"allowed": true, "buckets": [{"balance": 0.0}], ...}
+```
+
+同一判足口径也作用于：批量裁决（差一个 ulp 的条目令整批 `committed=false`、
+业务数据回滚，批次失败结果仍按 `batch_id` 重放）、预占创建（差一个 ulp 存档为
+`rejected`，同载荷可重放）、结算补扣（多用的差额差一个 ulp 不足时返回 409、
+预占保持 pending 不扣款）与路由移拨（源余额差一个 ulp 返回 409、不扣增；
+目标加 `amount` 差一个 ulp 超容量同样 409）。只读的预演、规划与上面的
+`retry_possible` 演算也使用相同规则。
+
 ### 4. 幂等重放与 409 冲突
 
 ```bash
@@ -1407,6 +1445,34 @@ admin_curl POST /route-transfers '{
     `DELETE /policy-changes/{id}` 可正常取消；已到期（含恰好到期）后取消返回 409。
   - 只读的 `POST /quota-plans` 仍按现行策略演算、**不推进**定时变更与预占到期
     状态（与到期判定正确性无关，保持其既有快照语义）。
+- **判足口径（严格足额，无浮点容差，本轮修复）**：
+  - 单笔裁决（`POST /decide`）、批量裁决（`POST /decide-batches`）、预占预扣
+    （`POST /reservations`）与结算补扣（`POST /reservations/{id}/settle`）、
+    路由桶移拨（`POST /route-transfers`）的余额判定统一为
+    **只有每个命中桶补充后的实际余额 `balance >= cost`（移拨为
+    `源余额 >= amount` 且 `目标余额 + amount <= 目标容量`）才执行扣减/扣增**，
+    不使用任何 `±ε` 容差放宽。
+  - 原因：判足放行后会无条件执行 `balance - cost` 落库，而 `buckets.balance`
+    带有 `CHECK (balance >= 0)` 约束。旧实现用 `balance + 1e-12 >= cost`
+    放宽判足，在「容量 1、补充率 0、`cost=1.0000000000005`」（余额只少一个
+    ulp）时会误放行，扣减产生负余额随即触发数据库 CHECK 约束——请求返回
+    **500 服务错误**，且事务回滚后**不会留下拒绝记录**。修正后该请求按正常
+    业务拒绝处理：HTTP 200、`allowed=false`（预占为 `rejected`、批次为
+    `committed=false`、移拨/补扣为 `409`），**绝不写出负余额**。
+  - 任一命中桶不足时的结果与此前完全一致：**整组一个令牌都不扣**（时间应得的
+    补充仍落库）、批量业务事务**整体回滚**、预占以 **rejected** 存档、
+    结算补扣返回 **409 且预占保持 pending 不扣款**、路由移拨返回 **409 不扣增**。
+    通过与拒绝的裁决（含成功/失败批次、rejected 预占）照常存档，拒绝记录可
+    同键重放。
+  - **恰好足额仍可通过**：浮点语义上余额恰等于消耗（如新桶满额扣等额 `cost`、
+    移拨后目标桶恰好等于容量）判为足额，扣减结果为 `0` / 恰好封顶，正常通过；
+    同键（`request_id` / `batch_id` / `reservation_id` / `transfer_id`）同载荷
+    重放原结果且**不再次扣减**的约定不变。
+  - 只读的**预演**（`POST /policies/impact-preview`）、**规划**
+    （`POST /quota-plans`）与拒绝后的**可重试时间**演算使用同一判足规则：
+    容量严格小于消耗（`cost > capacity`）或最终策略 `refill_rate=0` 且当前不足
+    时，不存在「等到某时刻即可足额」的路径，返回 `retry_possible=false`、
+    `retry_at=null`；容量恰好等于 `cost` 仍视为可在补满后足额。
 
 ## 本地开发（不用 Docker）
 

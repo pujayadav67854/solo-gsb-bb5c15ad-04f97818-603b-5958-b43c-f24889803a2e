@@ -4299,3 +4299,197 @@ def test_legacy_whole_second_rows_in_db_are_handled(tmp_path, monkeypatch):
         assert r.status_code == 200
         assert r.json()["buckets"][0]["capacity"] == 50.0
         assert client.get("/policy-changes/chg-legacy").json()["status"] == "applied"
+
+
+# ======================================== 严格判足（无容差）：余额绝不写负
+#
+# 旧实现用 ``balance + 1e-12 >= cost`` 放宽判足。当容量为 1、补充率为 0、
+# cost=1.0000000000005（余额只少一个 ulp）时会被误放行，扣减得到负余额随即
+# 触发 buckets.balance 的 CHECK(balance >= 0) 约束——请求变成 500 服务错误，
+# 且事务回滚后不会留下拒绝记录。以下用例锁定修正后的严格口径：只有每个命中
+# 桶的**实际**余额足以扣减才扣减；恰好足额仍通过；任一桶不足沿用「整组不扣 /
+# 批次回滚 / 预占拒绝 / 移拨冲突」的既有结果，只读预演/规划与拒绝后可重试
+# 时间也按同一规则演算。
+OVER = 1.0000000000005  # 比 1 大一个 ulp，旧的 1e-12 容差会误放行
+
+
+def test_decide_ulp_over_balance_is_denied_without_negative_balance(client):
+    # 容量 1、补充率 0、cost=1.0000000000005：判足不得放行，更不得写出负余额
+    put_policy(client, "global", 1, 0)
+    r = client.post("/decide", json={"request_id": "d-over", "cost": OVER})
+    assert r.status_code == 200  # 业务正常裁决（拒绝），而非 500
+    body = r.json()
+    assert body["allowed"] is False
+    assert body["retry_possible"] is False  # 容量恒低于消耗且无补足路径
+    assert body["retry_at"] is None
+    assert body["retry_after_seconds"] is None
+    bal = body["buckets"][0]
+    assert bal["balance"] == 1.0  # 整组一个令牌都不扣
+
+    # 拒绝记录已存档：同键同载荷重放原拒绝，不再次扣减
+    replay = client.post("/decide", json={"request_id": "d-over", "cost": OVER})
+    assert replay.status_code == 200
+    rep = replay.json()
+    assert rep["allowed"] is False and rep["replayed"] is True
+    assert rep["buckets"][0]["balance"] == 1.0
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+
+
+def test_decide_exact_full_cost_still_passes(client):
+    # 恰好足额（新桶满额扣等额 cost）必须照常通过，扣减后余额恰为 0
+    put_policy(client, "global", 1, 0)
+    r = client.post("/decide", json={"request_id": "d-exact", "cost": 1.0})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["allowed"] is True
+    assert body["buckets"][0]["balance"] == 0.0
+
+
+def test_decide_multilevel_one_ulp_short_bucket_denies_and_deducts_none(client):
+    # 多级：全局余 1（差一个 ulp），租户余 10；任一命中桶不足则整组不扣
+    put_policy(client, "global", 1, 0)
+    put_policy(client, "tenant", 10, 0, tenant="t1")
+    body = client.post(
+        "/decide",
+        json={"request_id": "d-multi", "tenant_id": "t1", "cost": OVER},
+    ).json()
+    assert body["allowed"] is False
+    assert body["retry_possible"] is False
+    by_scope = {b["scope"]: b["balance"] for b in body["buckets"]}
+    assert by_scope == {"global": 1.0, "tenant": 10.0}
+
+
+def test_batch_ulp_over_rolls_back_and_failed_batch_is_replayable(client):
+    put_policy(client, "global", 2, 0)
+    # 先落一个桶行并消耗到余额恰为 1，随后 cost=OVER 差一个 ulp 必须整批回滚
+    client.post("/decide", json={"request_id": "seed", "cost": 1})
+    payload = [{"request_id": "q1", "cost": OVER}]
+    r = post_batch(client, "batch-over", payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["committed"] is False
+    assert body["failed_index"] == 0
+    assert body["failure"]["reason"] == "insufficient_balance"
+    # 批次回滚：桶不被扣成负数，失败项 request_id 不占用普通裁决存档
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+    assert client.get("/events").json() == []
+    # 失败批次同样按 batch_id + 完整载荷幂等重放
+    again = post_batch(client, "batch-over", payload).json()
+    assert again["committed"] is False and again["replayed"] is True
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+
+
+def test_batch_exact_cost_commits(client):
+    # 批量中恰好足额的条目仍可整批提交
+    put_policy(client, "global", 1, 0)
+    body = post_batch(client, "batch-exact", [{"request_id": "q1", "cost": 1.0}]).json()
+    assert body["committed"] is True
+    assert body["results"][0]["buckets"][0]["balance"] == 0.0
+
+
+def test_reservation_create_ulp_over_is_rejected_not_negative(client, clock):
+    put_policy(client, "global", 1, 0)
+    r = _reserve(client, "rsv-over", OVER, ttl=60)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "rejected"
+    assert body["allowed"] is False
+    assert body["buckets"][0]["balance"] == 1.0  # 预占拒绝一个都不扣
+    # 拒绝结果同载荷重放，不重复扣减
+    again = _reserve(client, "rsv-over", OVER, ttl=60).json()
+    assert again["status"] == "rejected" and again["replayed"] is True
+    assert client.get("/buckets").json()[0]["balance"] == 1.0
+
+
+def test_settle_extra_charge_ulp_short_conflicts_and_keeps_pending(client, clock):
+    # 预占 1（桶 1 -> 0），结算 actual=2.0000000000005 需要补扣 1.0000000000005，
+    # 补充率 0 余额仍为 0 -> 补扣冲突 409，预占保持 pending、不写出负余额
+    put_policy(client, "global", 1, 0)
+    assert _reserve(client, "rsv-s", 1, ttl=60).json()["status"] == "pending"
+    assert client.get("/buckets").json()[0]["balance"] == 0.0
+    r = _settle(client, "rsv-s", 1.0 + OVER)
+    assert r.status_code == 409
+    assert client.get("/reservations/rsv-s").json()["status"] == "pending"
+    assert client.get("/buckets").json()[0]["balance"] == 0.0
+    # 恰好等额的补扣差额（0 净扣补意义上不可达；此处验证恰好 1 的补扣可行）：
+    # 实际用量恰为预占量 -> 正常 settled，余额仍为 0
+    assert _settle(client, "rsv-s", 1).status_code == 200
+    assert client.get("/reservations/rsv-s").json()["status"] == "settled"
+    assert client.get("/buckets").json()[0]["balance"] == 0.0
+
+
+def test_route_transfer_ulp_over_source_conflicts_without_negative(client):
+    # 源、目标容量均为 2 且各先消耗到余 1（源判足先于目标容量检查）：移拨
+    # 1.0000000000005 旧实现会把源桶扣成 -5e-13 触发 CHECK（500）；修正后
+    # 严格判足 -> 409，源不扣、目标不增
+    _setup_two_routes(client, cap_a=2, cap_b=2, rate=0)
+    client.post(
+        "/decide",
+        json={"request_id": "d-a", "tenant_id": "t1", "route_id": "rA", "cost": 1},
+    )
+    client.post(
+        "/decide",
+        json={"request_id": "d-b", "tenant_id": "t1", "route_id": "rB", "cost": 1},
+    )  # rA=1、rB=1
+    r = _transfer(client, "tr-over", "t1", "rA", "rB", OVER)
+    assert r.status_code == 409
+    assert _route_balance(client, "t1", "rA") == 1.0
+    assert _route_balance(client, "t1", "rB") == 1.0
+    # 失败不存档：同一 transfer_id 用恰好足额（1.0）的移拨仍可成功
+    ok = _transfer(client, "tr-over", "t1", "rA", "rB", 1.0)
+    assert ok.status_code == 200
+    assert ok.json()["source"]["balance"] == 0.0
+    assert ok.json()["target"]["balance"] == 2.0  # 恰好等于容量
+
+
+def test_route_transfer_target_ulp_over_capacity_conflicts(client):
+    # 目标桶余 1（已消耗到恰好差一个满额缺口），容量 2；移入 OVER 后
+    # 1 + OVER > 2 -> 目标超容量冲突，源不扣、目标不增
+    _setup_two_routes(client, cap_a=2, cap_b=2, rate=0)
+    client.post(
+        "/decide",
+        json={"request_id": "d-a", "tenant_id": "t1", "route_id": "rA", "cost": 1},
+    )  # rA=1
+    client.post(
+        "/decide",
+        json={"request_id": "d-b", "tenant_id": "t1", "route_id": "rB", "cost": 1},
+    )  # rB=1
+    r = _transfer(client, "tr-over2", "t1", "rA", "rB", OVER)
+    assert r.status_code == 409
+    assert _route_balance(client, "t1", "rA") == 1.0
+    assert _route_balance(client, "t1", "rB") == 1.0
+
+
+def test_impact_preview_uses_strict_sufficiency(client):
+    # 容量 1、速率 0；现行与候选同为容量 1 时，cost=OVER 在两侧都必须判拒绝
+    put_policy(client, "global", 1, 0)
+    r = post_preview(
+        client, "global", 1, 0, [{"cost": OVER, "at_seconds": 0}]
+    )
+    assert r.status_code == 200
+    item = r.json()["items"][0]
+    assert item["current"]["allowed"] is False
+    assert item["candidate"]["allowed"] is False
+    assert item["current"]["buckets"][0]["balance"] == 1.0
+    assert item["allowed_changed"] is False
+
+
+def test_quota_plan_excludes_ulp_over_cost_item(client):
+    # 容量 1、速率 0：cost=OVER 的项任何桶都承担不起，不得入选，桶剩余额保持 1
+    put_policy(client, "global", 1, 0)
+    body = post_plan(client, [_plan_item("big", OVER, 100)]).json()
+    assert body["selected_item_ids"] == []
+    assert body["unselected_item_ids"] == ["big"]
+    assert body["total_value"] == 0
+    assert body["buckets"][0]["balance"] == 1.0
+
+
+def test_retry_prediction_ulp_oversized_cost_is_impossible(client):
+    # 容量 1、速率 0：满桶也只余 1，cost=OVER 恒大于容量 -> 容量始终低于消耗、
+    # 无可补足路径，必须判为不可重试（旧容差会在满额时误判「已就绪」）
+    put_policy(client, "global", 1, 0)
+    body = client.post("/decide", json={"request_id": "d-imp", "cost": OVER}).json()
+    assert body["allowed"] is False
+    assert body["retry_possible"] is False
+    assert body["retry_at"] is None
+    assert body["retry_after_seconds"] is None
